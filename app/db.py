@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS issue_batches (
 );
 """,
     """
+CREATE TABLE IF NOT EXISTS delivery_archives (
+    archive_no   TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    request      JSONB NOT NULL,
+    response     JSONB NOT NULL,
+    cert_nos     TEXT[] NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+""",
+    """
 CREATE TABLE IF NOT EXISTS correction_declarations (
     declaration_no TEXT PRIMARY KEY,
     cert_no        TEXT NOT NULL REFERENCES certificates(cert_no),
@@ -39,9 +49,9 @@ CREATE TABLE IF NOT EXISTS correction_declarations (
 );
 """,
     """
-CREATE OR REPLACE FUNCTION corrections_immutable() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION append_only_sealed() RETURNS trigger AS $$
 BEGIN
-    RAISE EXCEPTION 'correction declarations are append-only (declaration_no=%)', OLD.declaration_no
+    RAISE EXCEPTION '% is append-only and sealed (trigger=%)', TG_TABLE_NAME, TG_NAME
         USING ERRCODE = 'check_violation';
 END;
 $$ LANGUAGE plpgsql;
@@ -49,12 +59,22 @@ $$ LANGUAGE plpgsql;
     """
 CREATE OR REPLACE TRIGGER trg_corrections_no_update
     BEFORE UPDATE ON correction_declarations
-    FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 """,
     """
 CREATE OR REPLACE TRIGGER trg_corrections_no_delete
     BEFORE DELETE ON correction_declarations
-    FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_delivery_archives_no_update
+    BEFORE UPDATE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_delivery_archives_no_delete
+    BEFORE DELETE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 """,
 )
 

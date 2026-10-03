@@ -640,6 +640,18 @@ def _get_declaration_row(conn, declaration_no: str, with_hash: bool = False) -> 
     ).fetchone()
 
 
+def _merged_display(certificate: dict, declarations: list[dict]) -> dict:
+    """按登记顺序（seq 升序）将声明合并到原证书的展示字段上。
+
+    同一字段后登记的声明覆盖先登记的；值为 None 表示显式置空，
+    未提交的字段不参与合并。
+    """
+    display = {field: certificate[field] for field in CORRECTABLE_FIELDS}
+    for decl in declarations:
+        display.update(decl["corrections"])
+    return display
+
+
 def _correction_view(conn, cert_no: str) -> dict:
     """证书的更正视图：原证书 + 按登记顺序排列的声明历史 + 合并后的当前展示。"""
     certificate = get_certificate(conn, cert_no)
@@ -648,12 +660,11 @@ def _correction_view(conn, cert_no: str) -> dict:
         "WHERE cert_no = %s ORDER BY seq ASC",
         (cert_no,),
     ).fetchall()
-    # 按登记顺序（seq 升序）逐条覆盖：同一字段后登记的声明覆盖先登记的；
-    # 值为 None 表示显式置空，未提交的字段不参与合并
-    display = {field: certificate[field] for field in CORRECTABLE_FIELDS}
-    for decl in declarations:
-        display.update(decl["corrections"])
-    return {"certificate": certificate, "declarations": declarations, "display": display}
+    return {
+        "certificate": certificate,
+        "declarations": declarations,
+        "display": _merged_display(certificate, declarations),
+    }
 
 
 def _correction_response(conn, existing_row: dict, req_hash: str) -> dict:
@@ -953,3 +964,262 @@ def list_revocations(conn, limit: int, offset: int) -> dict:
         (limit, offset),
     ).fetchall()
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# 客户交付归档包（冻结创建时刻的可交付追溯凭据：原始签发内容 + 追溯链 + 合并展示）
+# ---------------------------------------------------------------------------
+
+def _delivery_request_hash(cert_nos: list[str]) -> tuple[str, dict]:
+    """规范化归档请求：有序列表原样参与指纹（顺序不同即不同请求）。"""
+    doc = {"cert_nos": list(cert_nos)}
+    canonical = json.dumps(doc, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), doc
+
+
+def _get_delivery_archive_row(conn, archive_no: str) -> dict | None:
+    return conn.execute(
+        "SELECT archive_no, request_hash, request, response, cert_nos, created_at "
+        "FROM delivery_archives WHERE archive_no = %s",
+        (archive_no,),
+    ).fetchone()
+
+
+def _delivery_replay_or_conflict(existing: dict, archive_no: str, req_hash: str) -> dict:
+    """归档包编号已存在：同有序列表 → 重放首次快照；不同列表 → 409 冲突。"""
+    if existing["request_hash"] != req_hash:
+        raise ApiError(
+            409,
+            "archive_conflict",
+            f"归档包编号 {archive_no} 已用于一份证书列表不同的交付请求；"
+            "同一归档包编号只允许重放完全相同的有序列表",
+            details={"archive_no": archive_no},
+        )
+    return existing["response"]
+
+
+def _lock_delivery_universe(conn, cert_nos: list[str]) -> None:
+    """锁定目标证书及其全部上游链（共享锁），保证整包对应同一个业务时点。
+
+    加锁顺序按“从追溯起点到下游”的深度升序、同深度按编号升序——与撤销事务
+    （被撤销证书先于下游、且总是祖先先于后代）及更正事务（仅锁目标行）的
+    加锁顺序一致或为其链上的一段，因此与并发撤销/更正之间不会形成等待环：
+    撤销/更正事务在本事务释放锁前无法提交，锁后的再读取看到的是统一状态，
+    快照不会混合新旧状态。FOR SHARE 不阻塞签发事务的外键检查（FOR KEY
+    SHARE 与之兼容），只阻塞会改状态/封印字段的撤销事务（FOR UPDATE）。
+    """
+    sql = """
+        WITH RECURSIVE targets AS (
+            SELECT DISTINCT cert_no
+            FROM unnest(%s::text[]) AS t(cert_no)
+        ),
+        walk AS (
+            SELECT cert_no, parent_cert_no, 0 AS dist
+            FROM certificates
+            WHERE cert_no IN (SELECT cert_no FROM targets)
+            UNION ALL
+            SELECT c.cert_no, c.parent_cert_no, w.dist + 1
+            FROM certificates c JOIN walk w ON c.cert_no = w.parent_cert_no
+        ),
+        universe AS (
+            SELECT cert_no, MIN(dist) AS dist
+            FROM walk GROUP BY cert_no
+        )
+        SELECT c.cert_no
+        FROM certificates c
+        JOIN universe u ON u.cert_no = c.cert_no
+        ORDER BY u.dist DESC, c.cert_no ASC
+        FOR SHARE OF c
+    """
+    conn.execute(sql, (cert_nos,)).fetchall()
+
+
+def _evaluate_delivery_targets(conn, cert_nos: list[str]) -> dict:
+    """在统一锁定后校验每张目标证书：存在、CALIBRATION、自身与全链 ACTIVE/PASS。
+
+    汇总全部不达标编号（整包拒绝时一次性指出），各分类按编号排序。
+    """
+    rows = {
+        r["cert_no"]: r
+        for r in conn.execute(
+            f"SELECT {_VIEW_COLS} FROM v_certificates WHERE cert_no = ANY(%s)",
+            (cert_nos,),
+        ).fetchall()
+    }
+    missing, wrong_kind, not_active, not_qualified, chain_bad = [], [], [], [], []
+    for no in cert_nos:
+        row = rows.get(no)
+        if row is None:
+            missing.append(no)
+            continue
+        if row["kind"] != "CALIBRATION":
+            # 基准证书不是可交付的“普通校准证书”，整包层面按目标不合格指出
+            wrong_kind.append(no)
+        if row["status"] != "ACTIVE":
+            not_active.append(no)
+        if row["conclusion"] != "PASS":
+            not_qualified.append(no)
+
+    # 仅对“存在且类型正确”的目标检查其完整上游链
+    chain_sql = """
+        WITH RECURSIVE walk AS (
+            SELECT cert_no, parent_cert_no, 0 AS depth
+            FROM certificates WHERE cert_no = %s
+            UNION ALL
+            SELECT c.cert_no, c.parent_cert_no, w.depth - 1
+            FROM certificates c JOIN walk w ON c.cert_no = w.parent_cert_no
+        )
+        CYCLE cert_no SET is_cycle USING cycle_path
+        SELECT vc.cert_no, vc.status, vc.conclusion
+        FROM walk w JOIN v_certificates vc ON vc.cert_no = w.cert_no
+        WHERE NOT w.is_cycle AND w.depth < 0
+    """
+    for no in cert_nos:
+        row = rows.get(no)
+        if row is None or row["kind"] != "CALIBRATION":
+            continue
+        bad_nodes = [
+            r["cert_no"]
+            for r in conn.execute(chain_sql, (no,)).fetchall()
+            if r["status"] != "ACTIVE" or r["conclusion"] != "PASS"
+        ]
+        if bad_nodes:
+            chain_bad.append(no)
+
+    problems: set[str] = set(missing) | set(wrong_kind) | set(not_active)
+    problems |= set(not_qualified) | set(chain_bad)
+    return {
+        "missing": sorted(missing),
+        "wrong_kind": sorted(wrong_kind),
+        "target_not_active": sorted(not_active),
+        "target_not_qualified": sorted(not_qualified),
+        "chain_not_eligible": sorted(chain_bad),
+        "all": sorted(problems),
+    }
+
+
+def _not_deliverable_error(req, problems: dict) -> ApiError:
+    categories = {
+        "missing": problems["missing"],
+        "not_calibration": problems["wrong_kind"],
+        "target_not_active": problems["target_not_active"],
+        "target_not_qualified": problems["target_not_qualified"],
+        "chain_not_eligible": problems["chain_not_eligible"],
+    }
+    return ApiError(
+        422,
+        "archive_not_deliverable",
+        "存在不存在或不满足交付条件的目标证书：仅接受目标均为 CALIBRATION，"
+        "且目标及各自完整上游链均处于 ACTIVE、结论 PASS 的组合；整包未保存。"
+        f"相关编号: {', '.join(problems['all'])}",
+        details={"archive_no": req.archive_no, "cert_nos": problems["all"], **categories},
+    )
+
+
+def _build_delivery_response(conn, req, created_at: datetime) -> dict:
+    """组装创建时刻快照：按提交顺序给出原始签发内容、追溯链与合并展示。"""
+    items = []
+    for no in req.cert_nos:
+        certificate = get_certificate(conn, no)
+        chain = get_chain(conn, no)
+        declarations = conn.execute(
+            f"SELECT {_DECL_COLS} FROM correction_declarations "
+            "WHERE cert_no = %s ORDER BY seq ASC",
+            (no,),
+        ).fetchall()
+        items.append({
+            "cert_no": no,
+            "certificate": certificate,
+            "chain": chain,
+            "display": _merged_display(certificate, declarations),
+        })
+    return {
+        "archive_no": req.archive_no,
+        "count": len(items),
+        "created_at": created_at,
+        "items": items,
+    }
+
+
+def _create_delivery_archive_once(conn, req, req_hash: str, request_doc: dict):
+    """单次事务尝试；返回 (响应体, 是否首次创建)。唯一冲突交由外层处理。"""
+    with conn.transaction():
+        existing = _get_delivery_archive_row(conn, req.archive_no)
+        if existing is not None:
+            return _delivery_replay_or_conflict(existing, req.archive_no, req_hash), False
+        _lock_delivery_universe(conn, req.cert_nos)
+        problems = _evaluate_delivery_targets(conn, req.cert_nos)
+        if problems["all"]:
+            raise _not_deliverable_error(req, problems)
+        created_at = datetime.now(timezone.utc)
+        response = _build_delivery_response(conn, req, created_at)
+        conn.execute(
+            """
+            INSERT INTO delivery_archives
+                (archive_no, request_hash, request, response, cert_nos, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                req.archive_no,
+                req_hash,
+                Jsonb(request_doc),
+                Jsonb(response, dumps=_json_dumps),
+                list(req.cert_nos),
+                created_at,
+            ),
+        )
+        return response, True
+
+
+def create_delivery_archive(conn, req) -> tuple[dict, bool]:
+    """冻结客户交付凭据，返回 (响应体, 是否首次创建)。
+
+    - 整包条件：目标编号互不重复、均为 CALIBRATION，且目标及各自完整上游链
+      均 ACTIVE、结论 PASS；任一不满足整包不保存，错误详情分类列出相关编号；
+    - 一致时点：目标与全部上游行在同一事务内按祖先优先顺序加 FOR SHARE 锁，
+      并发撤销（FOR UPDATE）与并发更正（目标行 FOR UPDATE）要么先于本包提交
+      （本包按新状态校验/合并），要么被阻塞到本包提交后（本包按旧状态快照），
+      整包不混合新旧状态；
+    - 幂等：同编号同有序列表重试返回首次快照（200，即使事后更正或撤销），
+      同编号不同列表返回 409 archive_conflict；并发同编号由主键兜底，
+      后到事务回滚后按已提交结果重放/判冲突；
+    - 与撤销事务理论上的加锁等待环由死锁检测兜底，回滚后整体重试。
+    """
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for no in req.cert_nos:
+        (duplicates if no in seen else seen).add(no)
+    if duplicates:
+        raise ApiError(
+            422,
+            "archive_cert_duplicate",
+            f"归档包内证书编号必须互不重复，重复编号: {', '.join(sorted(duplicates))}",
+            details={"archive_no": req.archive_no, "cert_nos": sorted(duplicates)},
+        )
+    req_hash, request_doc = _delivery_request_hash(req.cert_nos)
+    for attempt in range(3):
+        try:
+            return _create_delivery_archive_once(conn, req, req_hash, request_doc)
+        except psycopg.errors.DeadlockDetected:
+            # 与并发撤销/更正理论上的加锁等待环由死锁检测终止：整体回滚后重试
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "archive_busy",
+                    f"归档包 {req.archive_no} 与并发撤销/更正竞争，重试后仍冲突，请稍后重试",
+                    details={"archive_no": req.archive_no},
+                )
+        except psycopg.errors.UniqueViolation:
+            # 并发同编号提交：主键兜底，后到事务回滚后按已提交结果重放/判冲突
+            existing = _get_delivery_archive_row(conn, req.archive_no)
+            if existing is not None:
+                return _delivery_replay_or_conflict(existing, req.archive_no, req_hash), False
+            raise
+
+
+def get_delivery_archive(conn, archive_no: str) -> dict:
+    """按归档包编号查询创建时刻快照；未知编号报不存在。"""
+    row = _get_delivery_archive_row(conn, archive_no)
+    if row is None:
+        raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
+    return row["response"]

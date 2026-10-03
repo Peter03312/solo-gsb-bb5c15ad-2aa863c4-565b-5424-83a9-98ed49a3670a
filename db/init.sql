@@ -114,6 +114,23 @@ CREATE TABLE issue_batches (
 );
 
 -- ----------------------------------------------------------------------------
+-- 客户交付归档包表：一次客户交付冻结的一组可交付追溯凭据。
+-- archive_no 为业务幂等键；request_hash 为规范化请求（有序证书编号列表）的
+-- 指纹，response 为创建时刻的完整快照（每张目标证书的原始签发内容、从基准到
+-- 目标的引用链、按当时已登记更正声明合并的展示字段）——同编号同列表重试原样
+-- 返回（即使证书事后被更正或撤销），同编号不同列表按 request_hash 判冲突。
+-- 本表只增不改，快照一经创建不受后续撤销/更正影响。
+-- ----------------------------------------------------------------------------
+CREATE TABLE delivery_archives (
+    archive_no   TEXT PRIMARY KEY,                 -- 归档包编号（幂等键，业务唯一）
+    request_hash TEXT NOT NULL,                    -- 规范化请求（有序列表）的 SHA-256
+    request      JSONB NOT NULL,                   -- 规范化请求快照
+    response     JSONB NOT NULL,                   -- 创建时刻的交付凭据快照（重试原样返回）
+    cert_nos     TEXT[] NOT NULL,                  -- 目标证书编号（按提交顺序）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ----------------------------------------------------------------------------
 -- 更正声明表：针对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明。
 -- declaration_no 为幂等键（全局唯一）；seq 为同一证书内按成功登记顺序分配的
 -- 序号（从 1 开始），合并展示时按 seq 升序逐条覆盖生效。corrections 仅保存
@@ -184,22 +201,31 @@ CREATE TRIGGER trg_certificates_no_delete
     FOR EACH ROW EXECUTE FUNCTION certificates_no_delete();
 
 -- ----------------------------------------------------------------------------
--- 触发器 3：更正声明只增不改、不得删除（声明历史不可篡改，顺序不可重排）
+-- 触发器 3：只增不改的业务凭据（更正声明、交付归档包）不得 UPDATE/DELETE
+-- 声明历史不可篡改、顺序不可重排；交付快照一经创建永久冻结。
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION corrections_immutable() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION append_only_sealed() RETURNS trigger AS $$
 BEGIN
-    RAISE EXCEPTION 'correction declarations are append-only (declaration_no=%)', OLD.declaration_no
+    RAISE EXCEPTION '% is append-only and sealed (trigger=%)', TG_TABLE_NAME, TG_NAME
         USING ERRCODE = 'check_violation';
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trg_corrections_no_update
     BEFORE UPDATE ON correction_declarations
-    FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 
 CREATE TRIGGER trg_corrections_no_delete
     BEFORE DELETE ON correction_declarations
-    FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+CREATE TRIGGER trg_delivery_archives_no_update
+    BEFORE UPDATE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+CREATE TRIGGER trg_delivery_archives_no_delete
+    BEFORE DELETE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

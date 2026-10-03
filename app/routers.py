@@ -13,6 +13,8 @@
 - POST   /api/v1/correction-declarations       登记更正声明（展示字段纠错，声明编号幂等）
 - GET    /api/v1/correction-declarations/{declaration_no}  按声明编号查询
 - GET    /api/v1/certificates/{cert_no}/corrections  证书更正视图（声明历史+合并展示）
+- POST   /api/v1/delivery-archives             创建客户交付归档包（冻结可交付凭据，编号幂等）
+- GET    /api/v1/delivery-archives/{archive_no}    按归档包编号查询创建时刻快照
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
@@ -27,6 +29,7 @@ from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
     CorrectionDeclarationRequest,
+    DeliveryArchiveRequest,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -132,6 +135,28 @@ def get_certificate_corrections(cert_no: str, pool: ConnectionPool = Depends(poo
     """证书的更正视图：原证书、声明历史（按登记顺序）与合并后的当前展示。"""
     with pool.connection() as conn:
         return repo.get_certificate_corrections(conn, cert_no)
+
+
+@router.post("/delivery-archives", status_code=201)
+def create_delivery_archive(
+    req: DeliveryArchiveRequest, response: Response, pool: ConnectionPool = Depends(pool_dep)
+):
+    """创建客户交付归档包：单事务冻结创建时刻的原始签发内容、追溯链与合并展示。
+
+    编号+有序列表均相同的重试返回首次快照（200）；同编号不同列表 409。
+    """
+    with pool.connection() as conn:
+        body, created = repo.create_delivery_archive(conn, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/delivery-archives/{archive_no}")
+def get_delivery_archive(archive_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """按归档包编号查询创建时刻快照；未知编号 404 archive_not_found。"""
+    with pool.connection() as conn:
+        return repo.get_delivery_archive(conn, archive_no)
 
 
 @router.get("/devices/{device_id}/certificates")

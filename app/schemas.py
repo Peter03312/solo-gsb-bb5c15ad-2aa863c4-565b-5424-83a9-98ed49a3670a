@@ -115,6 +115,24 @@ class BatchIssueRequest(BaseModel):
     )
 
 
+class DeliveryArchiveRequest(BaseModel):
+    """客户交付归档：归档包编号 + 非空目标证书编号列表（顺序即交付顺序）。
+
+    仅接受编号互不重复、目标均为 CALIBRATION，且目标及各自完整上游链均
+    ACTIVE、结论 PASS 的组合；任一证书不存在或不合格，整包不保存。
+    archive_no 为幂等键：同编号同有序列表重试返回首次快照，同编号不同列表
+    报冲突（列表顺序不同即视为不同列表）。
+    """
+    archive_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="归档包编号（幂等键）：同编号同列表重放首次快照，同编号不同列表报冲突",
+    )
+    cert_nos: list[str] = Field(
+        ..., min_length=1, max_length=500,
+        description="目标证书编号列表（非空，按交付顺序；编号必须互不重复）",
+    )
+
+
 class CertificateOut(BaseModel):
     cert_no: str
     kind: CertKind
@@ -234,6 +252,25 @@ class PagedCertificates(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class DeliveryArchiveItemOut(BaseModel):
+    """单张目标证书的交付凭据：原始签发内容 + 从基准到目标的链 + 合并展示字段。"""
+    cert_no: str
+    certificate: CertificateOut = Field(..., description="原始签发内容（不受更正影响）")
+    chain: TraceChainOut = Field(..., description="从追溯起点(基准)到目标证书的引用链")
+    display: CorrectionDisplay = Field(
+        ..., description="按归档时刻已登记更正声明合并后的展示字段"
+    )
+
+
+class DeliveryArchiveResponse(BaseModel):
+    archive_no: str
+    count: int
+    created_at: datetime = Field(..., description="归档包创建时刻（快照冻结时点）")
+    items: list[DeliveryArchiveItemOut] = Field(
+        ..., description="各目标证书的交付凭据，按提交列表顺序返回"
+    )
 
 
 class ErrorBody(BaseModel):
