@@ -5,7 +5,7 @@
 有效期统一按半开区间 [valid_from, valid_to) 解释，首尾相接不算重叠。
 """
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -115,6 +115,22 @@ class BatchIssueRequest(BaseModel):
     )
 
 
+class DeliveryArchiveRequest(BaseModel):
+    """客户交付归档包：唯一归档包编号 + 非空且编号互不重复的目标证书编号有序列表。
+
+    archive_no 为幂等键：同编号且有序列表完全相同的重试返回首次冻结快照（即使
+    目标证书事后被更正或撤销）；同编号不同列表报冲突。列表顺序即返回顺序。
+    """
+    archive_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="归档包编号（幂等键，业务唯一）",
+    )
+    cert_nos: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        ..., min_length=1, max_length=500,
+        description="目标证书编号有序列表（非空、编号互不重复）；按提交顺序返回",
+    )
+
+
 class CertificateOut(BaseModel):
     cert_no: str
     kind: CertKind
@@ -202,6 +218,29 @@ class CorrectionDisplay(BaseModel):
     device_name: str | None = None
     operator: str | None = None
     remark: str | None = None
+
+
+class DeliveryArchiveItemOut(BaseModel):
+    """单张目标证书在归档时刻冻结的可交付凭据。"""
+    cert_no: str
+    certificate: CertificateOut = Field(
+        ..., description="原始签发内容（不受更正影响）"
+    )
+    chain: TraceChainOut = Field(
+        ..., description="从追溯起点(基准)到目标证书的完整引用链"
+    )
+    display: CorrectionDisplay = Field(
+        ..., description="按归档时刻已登记更正声明合并后的展示字段"
+    )
+
+
+class DeliveryArchiveResponse(BaseModel):
+    archive_no: str
+    count: int
+    created_at: datetime = Field(..., description="归档包创建时刻（快照冻结时点）")
+    items: list[DeliveryArchiveItemOut] = Field(
+        ..., description="每张目标证书的原始内容/引用链/合并展示，按提交列表顺序返回"
+    )
 
 
 class CertificateCorrectionsOut(BaseModel):

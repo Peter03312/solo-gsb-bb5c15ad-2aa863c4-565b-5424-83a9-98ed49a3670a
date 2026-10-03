@@ -5,6 +5,8 @@
 - POST   /api/v1/certificates                  签发普通校准证书
 - POST   /api/v1/certificate-batches           批量签发交接批次（整批原子、批次键幂等）
 - GET    /api/v1/certificate-batches/{batch_key}  查询签发批次（首次签发结果快照）
+- POST   /api/v1/delivery-archives              交付归档包（冻结可交付凭据，编号幂等）
+- GET    /api/v1/delivery-archives/{archive_no}  按编号查询交付归档快照
 - GET    /api/v1/certificates                  证书列表（可按设备/状态/类型过滤）
 - GET    /api/v1/certificates/{cert_no}        证书详情（历史内容始终可查）
 - GET    /api/v1/certificates/{cert_no}/chain  完整追溯引用链
@@ -27,6 +29,8 @@ from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
     CorrectionDeclarationRequest,
+    DeliveryArchiveRequest,
+    DeliveryArchiveResponse,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -67,6 +71,27 @@ def get_certificate_batch(batch_key: str, pool: ConnectionPool = Depends(pool_de
     """按批次键查询首次签发结果（快照，不受事后撤销影响）。"""
     with pool.connection() as conn:
         return repo.get_issue_batch(conn, batch_key)
+
+
+@router.post("/delivery-archives", status_code=201, response_model=DeliveryArchiveResponse)
+def create_delivery_archive(
+    req: DeliveryArchiveRequest, response: Response, pool: ConnectionPool = Depends(pool_dep)
+):
+    """交付归档包：冻结当时可交付的追溯凭据；编号幂等（同编号同有序列表重放首次快照）。"""
+    with pool.connection() as conn:
+        body, created = repo.create_delivery_archive(conn, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get(
+    "/delivery-archives/{archive_no}", response_model=DeliveryArchiveResponse
+)
+def get_delivery_archive(archive_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """按归档包编号查询创建时刻冻结的交付凭据快照。"""
+    with pool.connection() as conn:
+        return repo.get_delivery_archive(conn, archive_no)
 
 
 @router.get("/certificates")

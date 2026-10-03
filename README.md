@@ -5,6 +5,9 @@
 证书时，其全部下游证书级联失效。离线采集的校准记录可作为**交接批次**整批签发：
 批次键幂等、整批原子落库、批内证书可相互引用。已签发证书的设备名称、操作员、备注
 录入有误时，可登记**更正声明**：声明按登记顺序生效、只增不改，原证书内容不受影响。
+向客户交付一组校准证书时，可创建**交付归档包**：以归档包编号与有序目标列表冻结
+创建时刻每张证书的原始签发内容、从基准到目标的引用链与合并更正后的展示字段，
+编号幂等、快照只增不改，并发撤销/更正下整包始终对应同一个一致业务时点。
 
 - 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg3
 - 关键业务不变量由**数据库约束 + 触发器 + 单事务**保证，不依赖应用层“先查后写”，
@@ -24,7 +27,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表、更正声明表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表、更正声明表、交付归档包表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -135,6 +138,20 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
    不受影响。声明编号为幂等键：同编号同内容重试返回首次声明（HTTP 200），
    同编号不同内容返回 `409 correction_conflict`；同一证书的并发更正由证书行锁
    串行化，声明顺序不丢失、不乱序。
+10. **客户交付归档包**：向客户交付一组校准证书时，以归档包编号 + 非空且编号
+    互不重复的目标证书有序列表，冻结创建时刻可交付的追溯凭据。仅接受：每个
+    目标均为普通校准证书（CALIBRATION）、状态 ACTIVE、结论 PASS，且其从基准
+    到目标的**完整上游链**全部 ACTIVE、PASS 的组合；任一目标不存在或不合格
+    （含任一上游已撤销/失效/不合格）则**整包不保存**，错误响应以
+    `details.cert_no` 指出相关编号。归档包按提交顺序返回每张目标证书的
+    **原始签发内容**、**从基准到目标的引用链**、以及**按已登记更正声明合并
+    后的展示字段**，并保存创建时刻与这些内容的快照（只增不改、数据库封印）。
+    可凭归档包编号查询该快照，未知编号返回 `404 delivery_archive_not_found`。
+    归档包编号为幂等键：编号与有序列表都相同的重试返回首次快照（HTTP 200，
+    即使之后目标被更正或撤销），同编号不同列表（含仅顺序不同）返回
+    `409 delivery_archive_conflict`。并发撤销/更正时，归档在单事务内对目标及
+    完整上游链加行锁，整包对应同一个一致业务时点，绝不混合新旧状态（与撤销
+    形成等待环时自动整体重试）。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -381,6 +398,82 @@ curl -sS http://localhost:8080/api/v1/correction-declarations/CORR-2026-0001 | p
 > 注意：`GET /api/v1/certificates/{cert_no}`、追溯链与批次快照始终返回签发时的
 > 原始字段值；合并后的展示值只通过上述更正相关接口获取。
 
+### 12. 创建客户交付归档包（冻结当时可交付的追溯凭据）
+
+向客户交付一组校准证书时，以归档包编号 + 非空、编号互不重复的目标证书**有序
+列表**冻结当时的可交付凭据。列表顺序即返回顺序：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/delivery-archives \
+  -H 'Content-Type: application/json' \
+  -d '{"archive_no": "DELIVERY-2026-10-03-001", "cert_nos": ["CAL-CUS-001", "CAL-WS-001"]}'
+```
+
+接受条件（任一不满足则**整包不保存**，错误响应以 `details.cert_no` 点名）：
+
+- `cert_nos` 非空且编号互不重复（重复 → `422 delivery_cert_duplicate`）；
+- 每张目标证书都存在（不存在 → `404 cert_not_found`）；
+- 目标均为普通校准证书（`CALIBRATION`；基准证书 →
+  `422 delivery_target_not_calibration`）；
+- 目标自身 ACTIVE（`422 delivery_target_not_active`）且 PASS
+  （`422 delivery_target_not_qualified`）；
+- 其从基准到目标的**完整上游链**每张证书都 ACTIVE（上游已撤销/失效 →
+  `422 delivery_upstream_not_active`）且 PASS（上游不合格 →
+  `422 delivery_upstream_not_qualified`）。
+
+首次成功响应 `201`，`items` 按提交顺序返回，每项含目标证书的**原始签发内容**
+`certificate`、**从基准到目标的引用链** `chain`、以及**按创建时刻已登记更正声明
+合并后的展示字段** `display`；并记录创建时刻 `created_at`：
+
+```json
+{
+  "archive_no": "DELIVERY-2026-10-03-001",
+  "count": 2,
+  "created_at": "2026-10-03T02:20:30.123456+00:00",
+  "items": [
+    {
+      "cert_no": "CAL-CUS-001",
+      "certificate": {"cert_no": "CAL-CUS-001", "device_name": "客户仪表B", "...": "原始签发内容"},
+      "chain": {"cert_no": "CAL-CUS-001", "root_cert_no": "REF-MASTER-001", "length": 3,
+                "nodes": [ {"certificate": {"cert_no": "REF-MASTER-001", "...": "原始内容"}},
+                           {"certificate": {"cert_no": "CAL-WS-001", "...": "原始内容"}},
+                           {"certificate": {"cert_no": "CAL-CUS-001", "...": "原始内容"}} ]},
+      "display": {"device_name": "客户仪表B", "operator": "王工", "remark": null}
+    },
+    {"cert_no": "CAL-WS-001", "certificate": {"...": "原始签发内容"},
+     "chain": {"...": "基准->CAL-WS-001"},
+     "display": {"device_name": "车间万用表A（FLUKE-17B）", "operator": null, "remark": null}}
+  ]
+}
+```
+
+- `certificate` 与 `chain.nodes[*].certificate` 始终是**签发时的原始内容**，不受
+  更正影响；`display` 才是按声明合并后的展示（仅 `device_name` / `operator` /
+  `remark` 三个字段）。
+- 快照与创建时刻一并冻结，之后无论更正还是撤销/级联失效都**不会改变**该归档包。
+
+### 13. 查询交付归档包（首次冻结快照）与重试约定
+
+```bash
+curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001 | python3 -m json.tool
+```
+
+幂等与冲突约定（与签发批次、更正声明一致）：
+
+- **同归档包编号 + 同有序列表重试** → `200`，返回首次冻结快照（与首次响应逐字节
+  一致）；**即使之后目标或其上游被更正、撤销**，也返回归档当时的内容；
+- **同编号不同列表**（含元素不同或仅顺序不同）→ `409 delivery_archive_conflict`，
+  `details.existing_cert_nos` 给出已存列表；
+- **未知归档包编号查询** → `404 delivery_archive_not_found`；
+- 资格不满足 / 编号重复 / 目标不存在 → 整包不保存，归档包编号不被占用，修正后
+  可用原编号重新提交。
+
+> 并发提示：归档在单条数据库事务内对“目标 + 各自完整上游链”的证书行统一加锁，
+> 与撤销事务互斥——快照读取期间相关撤销无法提交，反之亦然，因此整包对应同一个
+> 一致业务时点，不会出现链上半新半旧；极端情况下归档与撤销形成等待环，由数据库
+> 死锁检测中止一方，服务端自动整体重试（极少数持续冲突返回 `503 delivery_busy`，
+> 客户端按幂等约定用相同请求重试即可）。
+
 ---
 
 ## 错误响应
@@ -389,11 +482,19 @@ curl -sS http://localhost:8080/api/v1/correction-declarations/CORR-2026-0001 | p
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` | 目标不存在 |
+| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `delivery_archive_not_found` | 目标不存在 |
 | 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发、批次与库内冲突） |
 | 409 | `batch_conflict` | 同一批次键提交了内容不同的签发请求 |
 | 409 | `correction_conflict` | 同一声明编号提交了内容不同的更正请求 |
+| 409 | `delivery_archive_conflict` | 同一归档包编号提交了目标列表（或顺序）不同的交付请求 |
 | 422 | `batch_cert_duplicate` | 批次内证书编号重复 |
+| 422 | `delivery_cert_duplicate` | 交付列表中证书编号重复（`details.cert_no`/`first_index`/`index` 点名） |
+| 422 | `delivery_target_not_calibration` | 交付目标不是普通校准证书（如基准证书） |
+| 422 | `delivery_target_not_active` | 交付目标当前非 ACTIVE（已撤销/级联失效），整包不保存 |
+| 422 | `delivery_target_not_qualified` | 交付目标结论非 PASS，整包不保存 |
+| 422 | `delivery_upstream_not_active` | 交付目标的某张完整上游链证书非 ACTIVE，整包不保存 |
+| 422 | `delivery_upstream_not_qualified` | 交付目标的某张完整上游链证书结论非 PASS，整包不保存 |
+| 503 | `delivery_busy` | 归档与并发撤销持续冲突、多次重试仍未完成（可用相同请求幂等重试） |
 | 422 | `correction_empty` | 更正声明的修正字段集合为空 |
 | 422 | `correction_field_not_allowed` | 更正了 device_name/operator/remark 之外的字段（`details.fields` 点名） |
 | 422 | `correction_field_invalid` | 更正字段值越界（如长度超限） |
@@ -421,6 +522,7 @@ scripts/smoke-test.sh                 # 17 项主流程与错误路径
 python3 scripts/extra_checks.py       # 21 项并发/边界/中段撤销补充检查
 python3 scripts/batch_checks.py       # 批次签发：原子性/乱序引用/幂等重放/键冲突/并发
 python3 scripts/correction_checks.py  # 更正声明：顺序生效/显式置空/幂等/冲突/并发
+python3 scripts/delivery_checks.py    # 交付归档包：资格/整包不落库/快照冻结/幂等/冲突/并发一致时点
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -431,4 +533,9 @@ python3 scripts/correction_checks.py  # 更正声明：顺序生效/显式置空
 更正声明的登记与顺序生效、显式置空与未提交的区分、原证书/追溯链/批次快照
 不受更正影响、已撤销/已失效证书可更正且状态判定不变、同编号同内容重放
 （含键序无关）、同编号异内容冲突、同一证书并发更正（8 线程 seq 1..8 不丢失
-不乱序）、并发同编号（同内容仅 1 次登记、异内容仅 1 次成功）与全部错误路径。
+不乱序）、并发同编号（同内容仅 1 次登记、异内容仅 1 次成功）与全部错误路径；
+交付归档包的资格校验（目标/完整上游链 ACTIVE 且 PASS、目标必须 CALIBRATION、
+编号互不重复、缺失点名、整包不落库）、原始内容+引用链+合并展示按序冻结、
+撤销/更正后同编号同列表重放仍返回首次快照、同编号异列表（含仅换序）冲突、
+未知编号 404，以及并发同编号（同列表仅 1 次落库）、并发撤销 ↔ 归档下整包
+始终对应同一一致时点（不混合新旧状态、无 5xx、被拒不落库）。

@@ -56,6 +56,34 @@ CREATE OR REPLACE TRIGGER trg_corrections_no_delete
     BEFORE DELETE ON correction_declarations
     FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
 """,
+    """
+CREATE TABLE IF NOT EXISTS delivery_archives (
+    archive_no   TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    request      JSONB NOT NULL,
+    response     JSONB NOT NULL,
+    cert_nos     TEXT[] NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+""",
+    """
+CREATE OR REPLACE FUNCTION delivery_archives_immutable() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'delivery archives are append-only (archive_no=%)', OLD.archive_no
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_delivery_archives_no_update
+    BEFORE UPDATE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION delivery_archives_immutable();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_delivery_archives_no_delete
+    BEFORE DELETE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION delivery_archives_immutable();
+""",
 )
 
 

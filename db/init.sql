@@ -133,6 +133,23 @@ CREATE TABLE correction_declarations (
 );
 
 -- ----------------------------------------------------------------------------
+-- 交付归档包表：客户交付一组校准证书时，以归档包编号冻结当时可交付的追溯凭据。
+-- archive_no 为幂等键；request/request_hash 为规范化请求（有序目标编号列表）
+-- 快照及其指纹，response 为创建时刻冻结的交付内容（每张目标证书的原始签发内容、
+-- 从基准到目标的引用链、按已登记更正声明合并后的展示字段）。同一归档包编号 +
+-- 完全相同的有序列表重放首次快照（即使证书事后被更正或撤销），同编号不同列表
+-- 判冲突。本表只增不改：冻结后任何人（含直连数据库）都无法改写或删除快照。
+-- ----------------------------------------------------------------------------
+CREATE TABLE delivery_archives (
+    archive_no   TEXT PRIMARY KEY,                 -- 归档包编号（幂等键，业务唯一）
+    request_hash TEXT NOT NULL,                    -- 规范化请求（有序列表）的 SHA-256
+    request      JSONB NOT NULL,                   -- 规范化请求快照（有序目标编号）
+    response     JSONB NOT NULL,                   -- 创建时刻冻结的交付凭据快照
+    cert_nos     TEXT[] NOT NULL,                  -- 目标证书编号（按提交顺序）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -200,6 +217,24 @@ CREATE TRIGGER trg_corrections_no_update
 CREATE TRIGGER trg_corrections_no_delete
     BEFORE DELETE ON correction_declarations
     FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
+
+-- ----------------------------------------------------------------------------
+-- 触发器 4：交付归档包只增不改、不得删除（交付凭据快照冻结后不可篡改）
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION delivery_archives_immutable() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'delivery archives are append-only (archive_no=%)', OLD.archive_no
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_delivery_archives_no_update
+    BEFORE UPDATE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION delivery_archives_immutable();
+
+CREATE TRIGGER trg_delivery_archives_no_delete
+    BEFORE DELETE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION delivery_archives_immutable();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

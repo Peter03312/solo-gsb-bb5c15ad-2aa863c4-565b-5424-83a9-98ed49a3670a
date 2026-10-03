@@ -30,9 +30,10 @@ app = FastAPI(
         "校验引用有效性、防止成环与有效期重叠，撤销时级联失效下游证书；"
         "支持离线采集批次的整批原子签发与批次键幂等重放；"
         "支持对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明，"
-        "声明按登记顺序生效且不改写原证书。"
+        "声明按登记顺序生效且不改写原证书；"
+        "支持客户交付归档包：冻结当时可交付的追溯凭据，编号幂等重放首次快照。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -73,6 +74,8 @@ def index():
             "POST /api/v1/certificates",
             "POST /api/v1/certificate-batches",
             "GET  /api/v1/certificate-batches/{batch_key}",
+            "POST /api/v1/delivery-archives",
+            "GET  /api/v1/delivery-archives/{archive_no}",
             "GET  /api/v1/certificates",
             "GET  /api/v1/certificates/{cert_no}",
             "GET  /api/v1/certificates/{cert_no}/chain",
